@@ -78,6 +78,10 @@ exec_mutex = threading.Semaphore(1)
 # whether to use Docker for execution
 DO_USE_DOCKER = None
 
+# start characters indicating that a lambda result should be parsed as JSON
+# TODO: check integration with StepFunctions, and whether this should be ('[', '{', '"') instead
+JSON_START_CHARS = ('[', '{')
+
 # lambda executor instance
 LAMBDA_EXECUTOR = lambda_executors.AVAILABLE_EXECUTORS.get(config.LAMBDA_EXECUTOR, lambda_executors.DEFAULT_EXECUTOR)
 
@@ -255,6 +259,8 @@ def process_sqs_message(message_body, message_attributes, queue_name, region_nam
         arns = [s.get('FunctionArn') for s in sources]
         LOG.debug('Found %s source mappings for event from SQS queue %s: %s' % (len(arns), queue_arn, arns))
         source = next(iter(sources), None)
+        if not source:
+            return False
         if source:
             arn = source['FunctionArn']
             event = {'Records': [{
@@ -274,7 +280,10 @@ def process_sqs_message(message_body, message_attributes, queue_name, region_nam
                 'messageAttributes': message_attributes,
                 'sqs': True,
             }]}
-            run_lambda(event=event, context={}, func_arn=arn)
+            result = run_lambda(event=event, context={}, func_arn=arn)
+            status_code = getattr(result, 'status_code', 200)
+            if status_code >= 400:
+                LOG.warning('Invoking Lambda %s from SQS message failed (%s): %s' % (arn, status_code, result.data))
             return True
     except Exception as e:
         LOG.warning('Unable to run Lambda function on SQS messages: %s %s' % (e, traceback.format_exc()))
@@ -284,9 +293,25 @@ def get_event_sources(func_name=None, source_arn=None):
     result = []
     for m in event_source_mappings:
         if not func_name or (m['FunctionArn'] in [func_name, func_arn(func_name)]):
-            if not source_arn or (m['EventSourceArn'].startswith(source_arn)):
+            if _arn_match(mapped=m['EventSourceArn'], occurred=source_arn):
                 result.append(m)
     return result
+
+
+def _arn_match(mapped, occurred):
+    if not occurred or mapped == occurred:
+        return True
+    # Some types of ARNs can end with a path separated by slashes, for
+    # example the ARN of a DynamoDB stream is tableARN/stream/ID.  It's
+    # a little counterintuitive that a more specific mapped ARN can
+    # match a less specific ARN on the event, but some integration tests
+    # rely on it for things like subscribing to a stream and matching an
+    # event labeled with the table ARN.
+    elif mapped.startswith(occurred):
+        suffix = mapped[len(occurred):]
+        return suffix[0] == '/'
+    else:
+        return False
 
 
 def get_function_version(arn, version):
@@ -399,6 +424,7 @@ def get_handler_file_from_name(handler_name, runtime=LAMBDA_DEFAULT_RUNTIME):
     elif runtime.startswith(LAMBDA_RUNTIME_CUSTOM_RUNTIME):
         file_ext = '.sh'
     else:
+        handler_name = handler_name.rpartition(delimiter)[0].replace(delimiter, os.path.sep)
         file_ext = '.py'
     return '%s%s' % (handler_name.split(delimiter)[0], file_ext)
 
@@ -453,15 +479,15 @@ def get_java_handler(zip_file_content, handler, main_file):
     """
     if not is_jar_archive(zip_file_content):
         with zipfile.ZipFile(BytesIO(zip_file_content)) as zip_ref:
+            # TODO: check if this is still needed (probably not)
             jar_entries = [e for e in zip_ref.infolist() if e.filename.endswith('.jar')]
-            if len(jar_entries) != 1:
-                raise ClientError('Expected exactly one *.jar entry in zip file, found %s' % len(jar_entries))
-            zip_file_content = zip_ref.read(jar_entries[0].filename)
-            LOG.info('Found jar file %s with %s bytes in Lambda zip archive' %
-                     (jar_entries[0].filename, len(zip_file_content)))
-            main_file = new_tmp_file()
-            save_file(main_file, zip_file_content)
-    if is_jar_archive(zip_file_content):
+            if len(jar_entries) == 1:
+                zip_file_content = zip_ref.read(jar_entries[0].filename)
+                LOG.info('Found single jar file %s with %s bytes in Lambda zip archive' %
+                         (jar_entries[0].filename, len(zip_file_content)))
+                main_file = new_tmp_file()
+                save_file(main_file, zip_file_content)
+    if is_zip_file(zip_file_content):
         def execute(event, context):
             result, log_output = lambda_executors.EXECUTOR_LOCAL.execute_java_lambda(
                 event, context, handler=handler, main_file=main_file)
@@ -477,6 +503,10 @@ def set_archive_code(code, lambda_name, zip_file_content=None):
     lambda_arn = func_arn(lambda_name)
     lambda_details = arn_to_lambda[lambda_arn]
     is_local_mount = code.get('S3Bucket') == BUCKET_MARKER_LOCAL
+
+    if is_local_mount and config.LAMBDA_REMOTE_DOCKER:
+        msg = 'Please note that Lambda mounts (bucket name "%s") cannot be used with LAMBDA_REMOTE_DOCKER=1'
+        raise Exception(msg % BUCKET_MARKER_LOCAL)
 
     # Stop/remove any containers that this arn uses.
     LAMBDA_EXECUTOR.cleanup(lambda_arn)
@@ -536,27 +566,24 @@ def set_function_code(code, lambda_name, lambda_cwd=None):
 
     # Set the appropriate lambda handler.
     lambda_handler = generic_handler
-    if runtime == LAMBDA_RUNTIME_JAVA8:
-        # The Lambda executors for Docker subclass LambdaExecutorContainers,
-        # which runs Lambda in Docker by passing all *.jar files in the function
-        # working directory as part of the classpath. Because of this, we need to
-        # save the zip_file_content as a .jar here.
-        lambda_handler, zip_file_content = get_java_handler(zip_file_content, handler_name, tmp_file)
-        if is_jar_archive(zip_file_content):
-            jar_tmp_file = '{working_dir}/{file_name}'.format(
-                working_dir=lambda_cwd, file_name=LAMBDA_JAR_FILE_NAME)
-            save_file(jar_tmp_file, zip_file_content)
 
-    else:
+    if runtime == LAMBDA_RUNTIME_JAVA8:
+        # The Lambda executors for Docker subclass LambdaExecutorContainers, which
+        # runs Lambda in Docker by passing all *.jar files in the function working
+        # directory as part of the classpath. Obtain a Java handler function below.
+        lambda_handler, zip_file_content = get_java_handler(zip_file_content, handler_name, tmp_file)
+
+    if not is_local_mount:
+        # Lambda code must be uploaded in Zip format
+        if not is_zip_file(zip_file_content):
+            raise ClientError(
+                'Uploaded Lambda code for runtime ({}) is not in Zip format'.format(runtime))
+        unzip(tmp_file, lambda_cwd)
+
+    # Obtain handler details for any non-Java Lambda function
+    if runtime != LAMBDA_RUNTIME_JAVA8:
         handler_file = get_handler_file_from_name(handler_name, runtime=runtime)
         handler_function = get_handler_function_from_name(handler_name, runtime=runtime)
-
-        if not is_local_mount:
-            # Lambda code must be uploaded in Zip format
-            if not is_zip_file(zip_file_content):
-                raise ClientError(
-                    'Uploaded Lambda code for runtime ({}) is not in Zip format'.format(runtime))
-            unzip(tmp_file, lambda_cwd)
 
         main_file = '%s/%s' % (lambda_cwd, handler_file)
         if not os.path.exists(main_file):
@@ -569,7 +596,7 @@ def set_function_code(code, lambda_name, lambda_cwd=None):
                     (is_local_mount, use_docker(), config.LAMBDA_REMOTE_DOCKER))
                 LOG.debug('Lambda archive content:\n%s' % file_list)
                 raise ClientError(error_response(
-                    'Unable to find handler script in Lambda archive. %s' % config_debug,
+                    'Unable to find handler script (%s) in Lambda archive. %s' % (main_file, config_debug),
                     400, error_type='ValidationError'))
 
         if runtime.startswith('python') and not use_docker():
@@ -623,7 +650,8 @@ def format_func_details(func_details, version=None, always_add_version=False):
         'MemorySize': func_details.memory_size,
         'LastModified': func_details.last_modified,
         'TracingConfig': {'Mode': 'PassThrough'},
-        'RevisionId': func_version.get('RevisionId')
+        'RevisionId': func_version.get('RevisionId'),
+        'State': 'Active'
     }
     if func_details.envvars:
         result['Environment'] = {
@@ -669,7 +697,10 @@ def get_lambda_policy(function):
         doc = doc if isinstance(doc, dict) else json.loads(doc)
         if not isinstance(doc['Statement'], list):
             doc['Statement'] = [doc['Statement']]
+        for stmt in doc['Statement']:
+            stmt['Principal'] = stmt.get('Principal') or {'AWS': TEST_AWS_ACCOUNT_ID}
         doc['PolicyArn'] = p['Arn']
+        doc['Id'] = 'default'
         docs.append(doc)
     policy = [d for d in docs if d['Statement'][0]['Resource'] == func_arn(function)]
     return (policy or [None])[0]
@@ -893,15 +924,14 @@ def update_function_configuration(function):
         lambda_details.envvars = env_vars
     if data.get('Timeout'):
         lambda_details.timeout = data['Timeout']
-    result = {}
-    return jsonify(result)
+    return jsonify(data)
 
 
 @app.route('%s/functions/<function>/policy' % PATH_ROOT, methods=['POST'])
 def add_permission(function):
     data = json.loads(to_str(request.data))
     iam_client = aws_stack.connect_to_service('iam')
-    sid = short_uid()
+    sid = data.get('StatementId')
     policy = {
         'Version': IAM_POLICY_VERSION,
         'Id': 'LambdaFuncAccess-%s' % sid,
@@ -941,8 +971,9 @@ def remove_permission(function, statement):
 def get_policy(function):
     policy = get_lambda_policy(function)
     if not policy:
-        return jsonify({}), 404
-    return jsonify({'Policy': policy})
+        return error_response('The resource you requested does not exist.',
+            404, error_type='ResourceNotFoundException')
+    return jsonify({'Policy': json.dumps(policy), 'RevisionId': 'test1234'})
 
 
 @app.route('%s/functions/<function>/invocations' % PATH_ROOT, methods=['POST'])
@@ -996,7 +1027,7 @@ def invoke_function(function):
                     details[key] = result[key]
         # Try to parse parse payload as JSON
         payload = details['Payload']
-        if payload and isinstance(payload, (str, bytes)) and payload[0] in ('[', '{', '"'):
+        if payload and isinstance(payload, (str, bytes)) and payload[0] in JSON_START_CHARS:
             try:
                 details['Payload'] = json.loads(details['Payload'])
             except Exception:

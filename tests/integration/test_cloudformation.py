@@ -1,8 +1,9 @@
 import os
+import json
 import unittest
 from localstack.constants import TEST_AWS_ACCOUNT_ID
 from localstack.utils.aws import aws_stack
-from localstack.utils.common import load_file, retry, short_uid
+from localstack.utils.common import load_file, retry, short_uid, to_str
 from localstack.utils.cloudformation import template_deployer
 from botocore.exceptions import ClientError
 from botocore.parsers import ResponseParserError
@@ -12,13 +13,31 @@ TEST_TEMPLATE_1 = os.path.join(THIS_FOLDER, 'templates', 'template1.yaml')
 TEST_TEMPLATE_2 = os.path.join(THIS_FOLDER, 'templates', 'template2.yaml')
 TEST_TEMPLATE_3 = """
 AWSTemplateFormatVersion: 2010-09-09
-Transform: AWS::Serverless-2016-10-31
 Resources:
   S3Setup:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: test-%s
 """ % short_uid()
+TEST_TEMPLATE_4 = """
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  LambdaRuntime:
+    Type: String
+    Default: python3.6
+Resources:
+  MyFunc:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: %s
+      Handler: index.handler
+      Runtime:
+        Ref: LambdaRuntime
+      InlineCode: |
+        def handler(event, context):
+            return {'hello': 'world'}
+"""
 
 
 def bucket_exists(name):
@@ -118,7 +137,7 @@ class CloudFormationTest(unittest.TestCase):
         # assert that queue has been created
         assert queue_exists('cf-test-queue-1')
         # assert that topic has been created
-        assert topic_exists('cf-test-topic-1-1')
+        assert topic_exists('%s-test-topic-1-1' % stack_name)
         # assert that stream has been created
         assert stream_exists('cf-test-stream-1')
         # assert that queue has been created
@@ -132,7 +151,7 @@ class CloudFormationTest(unittest.TestCase):
         subs = sns.list_subscriptions()['Subscriptions']
         subs = [s for s in subs if (':%s:cf-test-queue-1' % TEST_AWS_ACCOUNT_ID) in s['Endpoint']]
         self.assertEqual(len(subs), 1)
-        self.assertIn(':%s:cf-test-topic-1-1' % TEST_AWS_ACCOUNT_ID, subs[0]['TopicArn'])
+        self.assertIn(':%s:%s-test-topic-1-1' % (TEST_AWS_ACCOUNT_ID, stack_name), subs[0]['TopicArn'])
 
         # assert that Gateway responses have been created
         test_api_name = 'test-api'
@@ -201,3 +220,18 @@ class CloudFormationTest(unittest.TestCase):
             TemplateBody=TEST_TEMPLATE_3, ChangeSetName='nochanges')
         self.assertIn(':%s:changeSet/nochanges/' % TEST_AWS_ACCOUNT_ID, response['Id'])
         self.assertIn(':%s:stack/' % TEST_AWS_ACCOUNT_ID, response['StackId'])
+
+    def test_sam_template(self):
+        cloudformation = aws_stack.connect_to_service('cloudformation')
+        awslambda = aws_stack.connect_to_service('lambda')
+
+        # deploy template
+        stack_name = 'stack-%s' % short_uid()
+        func_name = 'test-%s' % short_uid()
+        template = TEST_TEMPLATE_4 % func_name
+        cloudformation.create_stack(StackName=stack_name, TemplateBody=template)
+
+        # run Lambda test invocation
+        result = awslambda.invoke(FunctionName=func_name)
+        result = json.loads(to_str(result['Payload'].read()))
+        self.assertEqual(result, {'hello': 'world'})

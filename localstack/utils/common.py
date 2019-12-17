@@ -1,6 +1,8 @@
 import io
 import os
 import re
+import pwd
+import grp
 import sys
 import json
 import uuid
@@ -13,6 +15,7 @@ import decimal
 import logging
 import zipfile
 import binascii
+import calendar
 import tempfile
 import threading
 import subprocess
@@ -20,6 +23,7 @@ import six
 import shutil
 import requests
 import dns.resolver
+import functools
 from io import BytesIO
 from contextlib import closing
 from datetime import datetime
@@ -58,6 +62,12 @@ LOG = logging.getLogger(__name__)
 
 # flag to indicate whether we've received and processed the stop signal
 INFRA_STOPPED = False
+
+# generic cache object
+CACHE = {}
+
+# lock for creating certificate files
+SSL_CERT_LOCK = threading.RLock()
 
 
 class CustomEncoder(json.JSONEncoder):
@@ -287,8 +297,23 @@ class CaptureOutput(object):
 # UTILITY METHODS
 # ----------------
 
+def synchronized(lock=None):
+    """
+    Synchronization decorator as described in
+    http://blog.dscpl.com.au/2014/01/the-missing-synchronized-decorator.html.
+    """
+    def _decorator(wrapped):
+        @functools.wraps(wrapped)
+        def _wrapper(*args, **kwargs):
+            with lock:
+                return wrapped(*args, **kwargs)
+        return _wrapper
+    return _decorator
 
-def is_string(s, include_unicode=True):
+
+def is_string(s, include_unicode=True, exclude_binary=False):
+    if isinstance(s, six.binary_type) and exclude_binary:
+        return False
     if isinstance(s, str):
         return True
     if include_unicode and isinstance(s, six.text_type):
@@ -298,6 +323,11 @@ def is_string(s, include_unicode=True):
 
 def is_string_or_bytes(s):
     return is_string(s) or isinstance(s, six.string_types) or isinstance(s, bytes)
+
+
+def is_base64(s):
+    regex = r'^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$'
+    return is_string(s) and re.match(regex, s)
 
 
 def md5(string):
@@ -480,7 +510,7 @@ def now():
 
 
 def mktime(timestamp):
-    return time.mktime(timestamp.timetuple())
+    return calendar.timegm(timestamp.timetuple())
 
 
 def mkdir(folder):
@@ -504,10 +534,21 @@ def ensure_readable(file_path, default_perms=None):
         os.chmod(file_path, default_perms)
 
 
-def chmod_r(path, mode):
-    """Recursive chmod"""
-    os.chmod(path, mode)
+def chown_r(path, user):
+    """ Recursive chown """
+    uid = pwd.getpwnam(user).pw_uid
+    gid = grp.getgrnam(user).gr_gid
+    os.chown(path, uid, gid)
+    for root, dirs, files in os.walk(path):
+        for dirname in dirs:
+            os.chown(os.path.join(root, dirname), uid, gid)
+        for filename in files:
+            os.chown(os.path.join(root, filename), uid, gid)
 
+
+def chmod_r(path, mode):
+    """ Recursive chmod """
+    os.chmod(path, mode)
     for root, dirnames, filenames in os.walk(path):
         for dirname in dirnames:
             os.chmod(os.path.join(root, dirname), mode)
@@ -521,6 +562,12 @@ def rm_rf(path):
     """
     if not path or not os.path.exists(path):
         return
+    # Running the native command can be an order of magnitude faster in Alpine on Travis-CI
+    if is_alpine():
+        try:
+            return run('rm -rf "%s"' % path)
+        except Exception:
+            pass
     # Make sure all files are writeable and dirs executable to remove
     chmod_r(path, 0o777)
     # check if the file is either a normal file, or, e.g., a fifo
@@ -600,12 +647,25 @@ def is_linux():
 
 def is_alpine():
     try:
-        if not os.path.exists('cat /etc/issue'):
-            return False
-        out = to_str(subprocess.check_output('cat /etc/issue', shell=True))
-        return 'Alpine' in out
+        if '_is_alpine_' not in CACHE:
+            CACHE['_is_alpine_'] = False
+            if not os.path.exists('/etc/issue'):
+                return False
+            out = to_str(subprocess.check_output('cat /etc/issue', shell=True))
+            CACHE['_is_alpine_'] = 'Alpine' in out
     except subprocess.CalledProcessError:
         return False
+    return CACHE['_is_alpine_']
+
+
+def get_arch():
+    if is_mac_os():
+        return 'osx'
+    if is_alpine():
+        return 'alpine'
+    if is_linux():
+        return 'linux'
+    raise Exception('Unable to determine system architecture')
 
 
 def short_uid():
@@ -727,6 +787,9 @@ def is_zip_file(content):
 
 
 def unzip(path, target_dir):
+    if is_alpine():
+        # Running the native command can be an order of magnitude faster in Alpine on Travis-CI
+        return run('cd %s; unzip %s' % (target_dir, path))
     try:
         zip_ref = zipfile.ZipFile(path, 'r')
     except Exception as e:
@@ -734,9 +797,11 @@ def unzip(path, target_dir):
         raise e
     # Make sure to preserve file permissions in the zip file
     # https://www.burgundywall.com/post/preserving-file-perms-with-python-zipfile-module
-    for file_entry in zip_ref.infolist():
-        _unzip_file_entry(zip_ref, file_entry, target_dir)
-    zip_ref.close()
+    try:
+        for file_entry in zip_ref.infolist():
+            _unzip_file_entry(zip_ref, file_entry, target_dir)
+    finally:
+        zip_ref.close()
 
 
 def _unzip_file_entry(zip_ref, file_entry, target_dir):
@@ -776,15 +841,20 @@ def cleanup_resources():
     cleanup_threads_and_processes()
 
 
+@synchronized(lock=SSL_CERT_LOCK)
 def generate_ssl_cert(target_file=None, overwrite=False, random=False, return_content=False, serial_number=None):
     # Note: Do NOT import "OpenSSL" at the root scope
     # (Our test Lambdas are importing this file but don't have the module installed)
     from OpenSSL import crypto
 
+    def all_exist(*files):
+        return all([os.path.exists(f) for f in files])
+
     if target_file and not overwrite and os.path.exists(target_file):
         key_file_name = '%s.key' % target_file
         cert_file_name = '%s.crt' % target_file
-        return target_file, cert_file_name, key_file_name
+        if all_exist(key_file_name, cert_file_name):
+            return target_file, cert_file_name, key_file_name
     if random and target_file:
         if '.' in target_file:
             target_file = target_file.replace('.', '.%s.' % short_uid(), 1)
@@ -793,7 +863,7 @@ def generate_ssl_cert(target_file=None, overwrite=False, random=False, return_co
 
     # create a key pair
     k = crypto.PKey()
-    k.generate_key(crypto.TYPE_RSA, 1024)
+    k.generate_key(crypto.TYPE_RSA, 2048)
 
     # create a self-signed cert
     cert = crypto.X509()
@@ -803,14 +873,23 @@ def generate_ssl_cert(target_file=None, overwrite=False, random=False, return_co
     subj.L = 'Some-Locality'
     subj.O = 'LocalStack Org'  # noqa
     subj.OU = 'Testing'
-    subj.CN = 'LocalStack'
+    subj.CN = 'localhost'
+    # Note: new requirements for recent OSX versions: https://support.apple.com/en-us/HT210176
+    # More details: https://www.iol.unh.edu/blog/2019/10/10/macos-catalina-and-chrome-trust
     serial_number = serial_number or 1001
+    cert.set_version(2)
     cert.set_serial_number(serial_number)
     cert.gmtime_adj_notBefore(0)
-    cert.gmtime_adj_notAfter(10 * 365 * 24 * 60 * 60)
+    cert.gmtime_adj_notAfter(2 * 365 * 24 * 60 * 60)
     cert.set_issuer(cert.get_subject())
     cert.set_pubkey(k)
-    cert.sign(k, 'sha1')
+    cert.add_extensions([
+        crypto.X509Extension(b'subjectAltName', False, b'DNS:localhost,IP:127.0.0.1'),
+        crypto.X509Extension(b'basicConstraints', True, b'CA:false'),
+        crypto.X509Extension(b'keyUsage', True, b'nonRepudiation,digitalSignature,keyEncipherment'),
+        crypto.X509Extension(b'extendedKeyUsage', True, b'serverAuth')
+    ])
+    cert.sign(k, 'SHA256')
 
     cert_file = StringIO()
     key_file = StringIO()
@@ -824,10 +903,21 @@ def generate_ssl_cert(target_file=None, overwrite=False, random=False, return_co
         cert_file_name = '%s.crt' % target_file
         # check existence to avoid permission denied issues:
         # https://github.com/localstack/localstack/issues/1607
-        if not os.path.exists(target_file):
-            save_file(target_file, file_content)
-            save_file(key_file_name, key_file_content)
-            save_file(cert_file_name, cert_file_content)
+        if not all_exist(target_file, key_file_name, cert_file_name):
+            for i in range(2):
+                try:
+                    save_file(target_file, file_content)
+                    save_file(key_file_name, key_file_content)
+                    save_file(cert_file_name, cert_file_content)
+                    break
+                except Exception as e:
+                    if i > 0:
+                        raise
+                    LOG.info('Unable to store certificate file under %s, using tmp file instead: %s' % (target_file, e))
+                    # Fix for https://github.com/localstack/localstack/issues/1743
+                    target_file = '%s.pem' % new_tmp_file()
+                    key_file_name = '%s.key' % target_file
+                    cert_file_name = '%s.crt' % target_file
             TMP_FILES.append(target_file)
             TMP_FILES.append(key_file_name)
             TMP_FILES.append(cert_file_name)

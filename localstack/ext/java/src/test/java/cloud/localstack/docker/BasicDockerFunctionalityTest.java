@@ -1,11 +1,14 @@
 package cloud.localstack.docker;
 
-import cloud.localstack.DockerTestUtils;
+import cloud.localstack.Localstack;
+import cloud.localstack.LocalstackTestRunner;
 import cloud.localstack.TestUtils;
 import cloud.localstack.docker.annotation.LocalstackDockerProperties;
 import com.amazon.sqs.javamessaging.SQSConnection;
 import com.amazon.sqs.javamessaging.SQSConnectionFactory;
 import com.amazonaws.auth.AWSStaticCredentialsProvider;
+import com.amazonaws.services.cloudwatch.*;
+import com.amazonaws.services.cloudwatch.model.*;
 import com.amazonaws.services.dynamodbv2.AmazonDynamoDB;
 import com.amazonaws.services.dynamodbv2.model.AttributeDefinition;
 import com.amazonaws.services.dynamodbv2.model.CreateTableRequest;
@@ -32,6 +35,7 @@ import com.amazonaws.util.IOUtils;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.runner.RunWith;
+import org.junit.Assert;
 
 import javax.jms.MessageConsumer;
 import javax.jms.MessageProducer;
@@ -44,7 +48,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-@RunWith(LocalstackDockerTestRunner.class)
+@RunWith(LocalstackTestRunner.class)
 @ExtendWith(LocalstackDockerExtension.class)
 @LocalstackDockerProperties(randomizePorts = true)
 public class BasicDockerFunctionalityTest {
@@ -56,7 +60,7 @@ public class BasicDockerFunctionalityTest {
     @org.junit.Test
     @org.junit.jupiter.api.Test
     public void testSecretsManager() throws Exception {
-        AWSSecretsManager secretsManager = DockerTestUtils.getClientSecretsManager();
+        AWSSecretsManager secretsManager = TestUtils.getClientSecretsManager();
 
         CreateSecretRequest createSecretRequest = new CreateSecretRequest();
         createSecretRequest.setName("my-secret-name");
@@ -72,7 +76,7 @@ public class BasicDockerFunctionalityTest {
     @org.junit.Test
     @org.junit.jupiter.api.Test
     public void testKinesis() throws Exception {
-        AmazonKinesis kinesis = DockerTestUtils.getClientKinesis();
+        AmazonKinesis kinesis = TestUtils.getClientKinesis();
 
         ListStreamsResult streamsResult = kinesis.listStreams();
 
@@ -91,7 +95,7 @@ public class BasicDockerFunctionalityTest {
     @org.junit.Test
     @org.junit.jupiter.api.Test
     public void testDynamo() throws Exception {
-        AmazonDynamoDB dynamoDB = DockerTestUtils.getClientDynamoDb();
+        AmazonDynamoDB dynamoDB = TestUtils.getClientDynamoDB();
 
         ListTablesResult tablesResult = dynamoDB.listTables();
         Assertions.assertThat(tablesResult.getTableNames()).hasSize(0);
@@ -110,7 +114,7 @@ public class BasicDockerFunctionalityTest {
     @org.junit.Test
     @org.junit.jupiter.api.Test
     public void testS3() throws Exception {
-        AmazonS3 client = DockerTestUtils.getClientS3();
+        AmazonS3 client = TestUtils.getClientS3();
 
         client.createBucket("test-bucket");
         List<Bucket> bucketList = client.listBuckets();
@@ -140,7 +144,7 @@ public class BasicDockerFunctionalityTest {
     @org.junit.Test
     @org.junit.jupiter.api.Test
     public void testSQS() throws Exception {
-        AmazonSQS client = DockerTestUtils.getClientSQS();
+        AmazonSQS client = TestUtils.getClientSQS();
 
         Map<String, String> attributeMap = new HashMap<>();
         attributeMap.put("DelaySeconds", "0");
@@ -170,9 +174,33 @@ public class BasicDockerFunctionalityTest {
         Assertions.assertThat(received.getText()).isEqualTo("Hello World!");
     }
 
+    @org.junit.Test
+    @org.junit.jupiter.api.Test
+    public void testCloudWatch() throws Exception {
+        AmazonCloudWatch client = TestUtils.getClientCloudWatch();
+        Dimension dimension = new Dimension()
+            .withName("UNIQUE_PAGES")
+            .withValue("URLS");
+        MetricDatum datum = new MetricDatum()
+            .withMetricName("PAGES_VISITED")
+            .withUnit(StandardUnit.None)
+            .withDimensions(dimension);
+        PutMetricDataRequest request = new PutMetricDataRequest()
+            .withNamespace("SITE/TRAFFIC")
+            .withMetricData(datum);
+        // assert no error gets thrown for null values
+        datum.setValue(null);
+        PutMetricDataResult response = client.putMetricData(request);
+        Assert.assertNotNull(response);
+        // assert success for double values
+        datum.setValue(123.4);
+        response = client.putMetricData(request);
+        Assert.assertNotNull(response);
+    }
+
     private SQSConnection createSQSConnection() throws Exception {
         SQSConnectionFactory connectionFactory = SQSConnectionFactory.builder().withEndpoint(
-                LocalstackDocker.INSTANCE.getEndpointSQS()).withAWSCredentialsProvider(
+                Localstack.INSTANCE.getEndpointSQS()).withAWSCredentialsProvider(
                 new AWSStaticCredentialsProvider(TestUtils.TEST_CREDENTIALS)).build();
         return connectionFactory.createConnection();
     }

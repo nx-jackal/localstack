@@ -6,6 +6,12 @@ import com.amazonaws.auth.AWSStaticCredentialsProvider;
 import com.amazonaws.auth.BasicAWSCredentials;
 import com.amazonaws.client.builder.AwsClientBuilder;
 import com.amazonaws.client.builder.ExecutorFactory;
+import com.amazonaws.services.cloudwatch.AmazonCloudWatch;
+import com.amazonaws.services.cloudwatch.AmazonCloudWatchClientBuilder;
+import com.amazonaws.services.dynamodbv2.AmazonDynamoDB;
+import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClientBuilder;
+import com.amazonaws.services.dynamodbv2.AmazonDynamoDBStreams;
+import com.amazonaws.services.dynamodbv2.AmazonDynamoDBStreamsClientBuilder;
 import com.amazonaws.services.kinesis.AmazonKinesis;
 import com.amazonaws.services.kinesis.AmazonKinesisAsync;
 import com.amazonaws.services.kinesis.AmazonKinesisAsyncClientBuilder;
@@ -57,8 +63,13 @@ public class TestUtils {
     }
 
     public static AmazonSQS getClientSQS() {
+        return getClientSQS(null);
+    }
+
+    public static AmazonSQS getClientSQS(String endpoint) {
+        endpoint = endpoint == null ? Localstack.INSTANCE.getEndpointSQS() : endpoint;
         return AmazonSQSClientBuilder.standard().
-                withEndpointConfiguration(getEndpointConfigurationSQS()).
+                withEndpointConfiguration(getEndpointConfiguration(endpoint)).
                 withCredentials(getCredentialsProvider()).build();
     }
 
@@ -121,18 +132,22 @@ public class TestUtils {
         return builder.build();
     }
 
-    public static AmazonS3 getClientS3SSL() {
-        AmazonS3ClientBuilder builder = AmazonS3ClientBuilder.standard().
-                withEndpointConfiguration(getEndpointConfigurationS3SSL()).
-                withCredentials(getCredentialsProvider());
-        builder.setPathStyleAccessEnabled(true);
-        return builder.build();
-    }
-
     public static AWSSecretsManager getClientSecretsManager() {
         return AWSSecretsManagerClientBuilder.standard().
                 withEndpointConfiguration(getEndpointConfigurationSecretsManager()).
                 withCredentials(getCredentialsProvider()).build();
+    }
+
+    public static AmazonDynamoDB getClientDynamoDB() {
+        return AmazonDynamoDBClientBuilder.standard()
+                .withEndpointConfiguration(getEndpointConfigurationDynamoDB())
+                .withCredentials(getCredentialsProvider()).build();
+    }
+
+    public static AmazonDynamoDBStreams getClientDynamoDBStreams() {
+        return AmazonDynamoDBStreamsClientBuilder.standard()
+                .withEndpointConfiguration(getEndpointConfigurationDynamoDBStreams())
+                .withCredentials(getCredentialsProvider()).build();
     }
 
     public static AmazonKinesis getClientKinesis() {
@@ -154,44 +169,50 @@ public class TestUtils {
                 withCredentials(getCredentialsProvider()).build();
     }
 
-    public static AWSCredentialsProvider getCredentialsProvider() {
-        return new AWSStaticCredentialsProvider(TEST_CREDENTIALS);
+    public static AmazonCloudWatch getClientCloudWatch() {
+        return AmazonCloudWatchClientBuilder.standard().
+                withEndpointConfiguration(getEndpointConfigurationCloudWatch()).
+                withCredentials(getCredentialsProvider()).build();
     }
 
     protected static AwsClientBuilder.EndpointConfiguration getEndpointConfigurationLambda() {
-        return getEndpointConfiguration(Localstack.getEndpointLambda());
+        return getEndpointConfiguration(Localstack.INSTANCE.getEndpointLambda());
     }
 
     protected static AwsClientBuilder.EndpointConfiguration getEndpointConfigurationKinesis() {
-        return getEndpointConfiguration(Localstack.getEndpointKinesis());
+        return getEndpointConfiguration(Localstack.INSTANCE.getEndpointKinesis());
+    }
+
+    protected static AwsClientBuilder.EndpointConfiguration getEndpointConfigurationDynamoDB() {
+        return getEndpointConfiguration(Localstack.INSTANCE.getEndpointDynamoDB());
+    }
+
+    protected static AwsClientBuilder.EndpointConfiguration getEndpointConfigurationDynamoDBStreams() {
+        return getEndpointConfiguration(Localstack.INSTANCE.getEndpointDynamoDBStreams());
     }
 
     protected static AwsClientBuilder.EndpointConfiguration getEndpointConfigurationSQS() {
-        return getEndpointConfiguration(Localstack.getEndpointSQS());
+        return getEndpointConfiguration(Localstack.INSTANCE.getEndpointSQS());
     }
 
     protected static AwsClientBuilder.EndpointConfiguration getEndpointConfigurationS3() {
-        return getEndpointConfiguration(Localstack.getEndpointS3());
+        return getEndpointConfiguration(Localstack.INSTANCE.getEndpointS3());
     }
 
     protected static AwsClientBuilder.EndpointConfiguration getEndpointConfigurationSNS() {
-        return getEndpointConfiguration(Localstack.getEndpointSNS());
+        return getEndpointConfiguration(Localstack.INSTANCE.getEndpointSNS());
     }
 
-    protected static AwsClientBuilder.EndpointConfiguration getEndpointConfigurationS3SSL() {
-        return getEndpointConfiguration(Localstack.getEndpointS3(true));
+    protected static AwsClientBuilder.EndpointConfiguration getEndpointConfigurationCloudWatch() {
+        return getEndpointConfiguration(Localstack.INSTANCE.getEndpointCloudWatch());
     }
 
     protected static AwsClientBuilder.EndpointConfiguration getEndpointConfigurationSecretsManager() {
-        return getEndpointConfiguration(Localstack.getEndpointSecretsmanager());
+        return getEndpointConfiguration(Localstack.INSTANCE.getEndpointSecretsmanager());
     }
 
     protected static AwsClientBuilder.EndpointConfiguration getEndpointConfigurationStepFunctions() {
-        return getEndpointConfiguration(Localstack.getEndpointStepFunctions());
-    }
-
-    protected static AwsClientBuilder.EndpointConfiguration getEndpointConfiguration(String endpointURL) {
-        return new AwsClientBuilder.EndpointConfiguration(endpointURL, DEFAULT_REGION);
+        return getEndpointConfiguration(Localstack.INSTANCE.getEndpointStepFunctions());
     }
 
     protected static void setEnv(Map<String, String> newEnv) {
@@ -268,4 +289,13 @@ public class TestUtils {
             throw new RuntimeException(e.getMessage(), e);
         }
     }
+
+    public static AWSCredentialsProvider getCredentialsProvider() {
+        return new AWSStaticCredentialsProvider(TEST_CREDENTIALS);
+    }
+
+    protected static AwsClientBuilder.EndpointConfiguration getEndpointConfiguration(String endpointURL) {
+        return new AwsClientBuilder.EndpointConfiguration(endpointURL, DEFAULT_REGION);
+    }
+
 }

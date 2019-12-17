@@ -1,10 +1,12 @@
 import os
 import re
+import glob
 import json
 import time
 import logging
 import threading
 import subprocess
+import six
 from multiprocessing import Process, Queue
 try:
     from shlex import quote as cmd_quote
@@ -40,6 +42,9 @@ LAMBDA_EVENT_FILE = 'event_file.json'
 
 LAMBDA_SERVER_UNIQUE_PORTS = 500
 LAMBDA_SERVER_PORT_OFFSET = 5000
+
+LAMBDA_API_UNIQUE_PORTS = 500
+LAMBDA_API_PORT_OFFSET = 9000
 
 # logger
 LOG = logging.getLogger(__name__)
@@ -138,19 +143,22 @@ class LambdaExecutor(object):
         process = run(cmd, asynchronous=True, stderr=subprocess.PIPE, outfile=subprocess.PIPE, env_vars=env_vars,
                       stdin=True)
         result, log_output = process.communicate(input=event)
-        result = to_str(result).strip()
+        try:
+            result = to_str(result).strip()
+        except Exception:
+            pass
         log_output = to_str(log_output).strip()
         return_code = process.returncode
         # Note: The user's code may have been logging to stderr, in which case the logs
         # will be part of the "result" variable here. Hence, make sure that we extract
         # only the *last* line of "result" and consider anything above that as log output.
-        if '\n' in result:
+        if isinstance(result, six.string_types) and '\n' in result:
             additional_logs, _, result = result.rpartition('\n')
             log_output += '\n%s' % additional_logs
 
         if return_code != 0:
-            raise Exception('Lambda process returned error status code: %s. Output:\n%s' %
-                (return_code, log_output))
+            raise Exception('Lambda process returned error status code: %s. Result: %s. Output:\n%s' %
+                (return_code, result, log_output))
 
         return result, log_output
 
@@ -221,8 +229,9 @@ class LambdaExecutorContainers(LambdaExecutor):
             # TODO cleanup once we have custom Java Docker image
             taskdir = '/var/task'
             save_file(os.path.join(lambda_cwd, LAMBDA_EVENT_FILE), event_body)
-            command = ("bash -c 'cd %s; java %s -cp \".:`ls *.jar | tr \"\\n\" \":\"`\" \"%s\" \"%s\" \"%s\"'" %
-                (taskdir, java_opts, LAMBDA_EXECUTOR_CLASS, handler, LAMBDA_EVENT_FILE))
+            classpath = Util.get_java_classpath(target_file)
+            command = ("bash -c 'cd %s; java %s -cp \"%s\" \"%s\" \"%s\" \"%s\"'" %
+                (taskdir, java_opts, classpath, LAMBDA_EXECUTOR_CLASS, handler, LAMBDA_EVENT_FILE))
 
         # determine the command to be executed (implemented by subclasses)
         cmd = self.prepare_execution(func_arn, environment, runtime, command, handler, lambda_cwd)
@@ -277,7 +286,7 @@ class LambdaExecutorReuseContainers(LambdaExecutorContainers):
         copy_command = ''
         docker_cmd = self._docker_cmd()
         event_file = os.path.join(lambda_cwd, LAMBDA_EVENT_FILE)
-        if not has_been_invoked_before:
+        if not has_been_invoked_before and config.LAMBDA_REMOTE_DOCKER:
             # if this is the first invocation: copy the entire folder into the container
             copy_command = '%s cp "%s/." "%s:/var/task";' % (docker_cmd, lambda_cwd, container_info.name)
         elif os.path.exists(event_file):
@@ -324,6 +333,9 @@ class LambdaExecutorReuseContainers(LambdaExecutorContainers):
             status = self.get_docker_container_status(func_arn)
             LOG.debug('Priming docker container (status "%s"): %s' % (status, container_name))
 
+            docker_image = Util.docker_image_for_runtime(runtime)
+            rm_flag = Util.get_docker_remove_flag()
+
             # Container is not running or doesn't exist.
             if status < 1:
                 # Make sure the container does not exist in any form/state.
@@ -334,31 +346,37 @@ class LambdaExecutorReuseContainers(LambdaExecutorContainers):
                 network = config.LAMBDA_DOCKER_NETWORK
                 network_str = '--network="%s"' % network if network else ''
 
+                mount_volume = not config.LAMBDA_REMOTE_DOCKER
+                lambda_cwd_on_host = Util.get_host_path_for_path_in_docker(lambda_cwd)
+                mount_volume_str = '-v "%s":/var/task' % lambda_cwd_on_host if mount_volume else ''
+
                 # Create and start the container
                 LOG.debug('Creating container: %s' % container_name)
                 cmd = (
                     '%s create'
-                    ' --rm'
+                    ' %s'  # --rm flag
                     ' --name "%s"'
                     ' --entrypoint /bin/bash'  # Load bash when it starts.
+                    ' %s'
                     ' --interactive'  # Keeps the container running bash.
                     ' -e AWS_LAMBDA_EVENT_BODY="$AWS_LAMBDA_EVENT_BODY"'
                     ' -e HOSTNAME="$HOSTNAME"'
                     ' -e LOCALSTACK_HOSTNAME="$LOCALSTACK_HOSTNAME"'
                     '  %s'  # env_vars
                     '  %s'  # network
-                    ' lambci/lambda:%s'
-                ) % (docker_cmd, container_name, env_vars_str, network_str, runtime)
+                    ' %s'
+                ) % (docker_cmd, rm_flag, container_name, mount_volume_str, env_vars_str, network_str, docker_image)
                 LOG.debug(cmd)
                 run(cmd)
 
-                LOG.debug('Copying files to container "%s" from "%s".' % (container_name, lambda_cwd))
-                cmd = (
-                    '%s cp'
-                    ' "%s/." "%s:/var/task"'
-                ) % (docker_cmd, lambda_cwd, container_name)
-                LOG.debug(cmd)
-                run(cmd)
+                if not mount_volume:
+                    LOG.debug('Copying files to container "%s" from "%s".' % (container_name, lambda_cwd))
+                    cmd = (
+                        '%s cp'
+                        ' "%s/." "%s:/var/task"'
+                    ) % (docker_cmd, lambda_cwd, container_name)
+                    LOG.debug(cmd)
+                    run(cmd)
 
                 LOG.debug('Starting container: %s' % container_name)
                 cmd = '%s start %s' % (docker_cmd, container_name)
@@ -368,12 +386,12 @@ class LambdaExecutorReuseContainers(LambdaExecutorContainers):
                 time.sleep(1)
 
             # Get the entry point for the image.
-            LOG.debug('Getting the entrypoint for image: lambci/lambda:%s' % runtime)
+            LOG.debug('Getting the entrypoint for image: %s' % (docker_image))
             cmd = (
                 '%s image inspect'
                 ' --format="{{ .ContainerConfig.Entrypoint }}"'
-                ' lambci/lambda:%s'
-            ) % (docker_cmd, runtime)
+                ' %s'
+            ) % (docker_cmd, docker_image)
 
             LOG.debug(cmd)
             run_result = run(cmd)
@@ -555,6 +573,12 @@ class LambdaExecutorReuseContainers(LambdaExecutorContainers):
 
 class LambdaExecutorSeparateContainers(LambdaExecutorContainers):
 
+    def __init__(self):
+        super(LambdaExecutorSeparateContainers, self).__init__()
+        self.next_port = 1
+        self.max_port = LAMBDA_API_UNIQUE_PORTS
+        self.port_offset = LAMBDA_API_PORT_OFFSET
+
     def prepare_event(self, environment, event_body):
 
         # Tell Lambci to use STDIN for the event
@@ -568,42 +592,48 @@ class LambdaExecutorSeparateContainers(LambdaExecutorContainers):
         else:
             command = '"%s"' % handler
 
-        env_vars_string = ' '.join(['-e {}="${}"'.format(k, k) for (k, v) in env_vars.items()])
-        debug_docker_java_port = '-p {p}:{p}'.format(p=Util.debug_java_port) if Util.debug_java_port else ''
         network = config.LAMBDA_DOCKER_NETWORK
         network_str = '--network="%s"' % network if network else ''
+        if network == 'host':
+            port = str(self.next_port + self.port_offset)
+            env_vars['DOCKER_LAMBDA_API_PORT'] = port
+            env_vars['DOCKER_LAMBDA_RUNTIME_PORT'] = port
+            self.next_port = (self.next_port + 1) % self.max_port
+
+        env_vars_string = ' '.join(['-e {}="${}"'.format(k, k) for (k, v) in env_vars.items()])
+        debug_docker_java_port = '-p {p}:{p}'.format(p=Util.debug_java_port) if Util.debug_java_port else ''
         docker_cmd = self._docker_cmd()
+        docker_image = Util.docker_image_for_runtime(runtime)
+        rm_flag = Util.get_docker_remove_flag()
 
         if config.LAMBDA_REMOTE_DOCKER:
             cmd = (
                 'CONTAINER_ID="$(%s create -i'
-                ' %s'
-                ' %s'
-                ' %s'
+                ' %s'  # entrypoint
+                ' %s'  # debug_docker_java_port
+                ' %s'  # env
                 ' %s'  # network
-                ' --rm'
-                ' "lambci/lambda:%s" %s'
+                ' %s'  # --rm flag
+                ' %s %s'  # image and command
                 ')";'
                 '%s cp "%s/." "$CONTAINER_ID:/var/task"; '
                 '%s start -ai "$CONTAINER_ID";'
-            ) % (docker_cmd, entrypoint, debug_docker_java_port, env_vars_string, network_str, runtime, command,
+            ) % (docker_cmd, entrypoint, debug_docker_java_port, env_vars_string, network_str, rm_flag,
+                 docker_image, command,
                  docker_cmd, lambda_cwd,
                  docker_cmd)
         else:
-            lambda_cwd_on_host = self.get_host_path_for_path_in_docker(lambda_cwd)
+            lambda_cwd_on_host = Util.get_host_path_for_path_in_docker(lambda_cwd)
             cmd = (
                 '%s run -i'
                 ' %s -v "%s":/var/task'
                 ' %s'
                 ' %s'  # network
-                ' --rm'
-                ' "lambci/lambda:%s" %s'
-            ) % (docker_cmd, entrypoint, lambda_cwd_on_host, env_vars_string, network_str, runtime, command)
+                ' %s'  # --rm flag
+                ' %s %s'
+            ) % (docker_cmd, entrypoint, lambda_cwd_on_host, env_vars_string,
+                 network_str, rm_flag, docker_image, command)
         return cmd
-
-    def get_host_path_for_path_in_docker(self, path):
-        return re.sub(r'^%s/(.*)$' % config.TMP_FOLDER,
-                    r'%s/\1' % config.HOST_TMP_FOLDER, path)
 
 
 class LambdaExecutorLocal(LambdaExecutor):
@@ -642,7 +672,7 @@ class LambdaExecutorLocal(LambdaExecutor):
         save_file(event_file, json.dumps(event))
         TMP_FILES.append(event_file)
         class_name = handler.split('::')[0]
-        classpath = '%s:%s' % (LAMBDA_EXECUTOR_JAR, main_file)
+        classpath = '%s:%s:%s' % (LAMBDA_EXECUTOR_JAR, main_file, Util.get_java_classpath(main_file))
         cmd = 'java -cp %s %s %s %s' % (classpath, LAMBDA_EXECUTOR_CLASS, class_name, event_file)
         result, log_output = self.run_lambda_executor(cmd)
         LOG.debug('Lambda result / log output:\n%s\n> %s' % (
@@ -661,6 +691,51 @@ class Util:
                 cls.debug_java_port = get_free_tcp_port()
             opts = opts.replace('_debug_port_', ('%s' % cls.debug_java_port))
         return opts
+
+    @classmethod
+    def get_host_path_for_path_in_docker(cls, path):
+        return re.sub(r'^%s/(.*)$' % config.TMP_FOLDER,
+                      r'%s/\1' % config.HOST_TMP_FOLDER, path)
+
+    @classmethod
+    def docker_image_for_runtime(cls, runtime):
+        docker_tag = runtime
+        docker_image = config.LAMBDA_CONTAINER_REGISTRY
+        # TODO: remove prefix once execution issues are fixed with dotnetcore/python lambdas
+        # See https://github.com/lambci/docker-lambda/pull/218
+        lambdas_to_add_prefix = ['dotnetcore', 'python']
+        if docker_image == 'lambci/lambda' and any(img in docker_tag for img in lambdas_to_add_prefix):
+            docker_tag = '20191117-%s' % docker_tag
+        return '"%s:%s"' % (docker_image, docker_tag)
+
+    @classmethod
+    def get_docker_remove_flag(cls):
+        return '--rm' if config.LAMBDA_REMOVE_CONTAINERS else ''
+
+    @classmethod
+    def get_java_classpath(cls, archive):
+        """
+        Return the Java classpath, using the parent folder of the
+        given archive as the base folder.
+
+        The result contains any *.jar files in the base folder, as
+        well as any JAR files in the "lib/*" subfolder living
+        alongside the supplied java archive (.jar or .zip).
+
+        :param archive: an absolute path to a .jar or .zip Java archive
+        :return: the Java classpath, relative to the base dir of "archive"
+        """
+        entries = ['.']
+        base_dir = os.path.dirname(archive)
+        for pattern in ['%s/*.jar', '%s/lib/*.jar']:
+            for entry in glob.glob(pattern % base_dir):
+                if os.path.realpath(archive) != os.path.realpath(entry):
+                    entries.append(os.path.relpath(entry, base_dir))
+        # make sure to append the localstack-utils.jar at the end of the classpath
+        # https://github.com/localstack/localstack/issues/1160
+        entries.append(os.path.relpath(archive, base_dir))
+        result = ':'.join(entries)
+        return result
 
 
 # --------------

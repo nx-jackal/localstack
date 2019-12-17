@@ -2,14 +2,17 @@ import re
 import os
 import json
 import time
+import shutil
 import unittest
+import six
 from io import BytesIO
 from localstack import config
 from localstack.constants import LOCALSTACK_ROOT_FOLDER, LOCALSTACK_MAVEN_VERSION
 from localstack.utils import testutil
 from localstack.utils.aws import aws_stack
 from localstack.utils.common import (
-    short_uid, load_file, to_str, mkdir, download, run_safe, get_free_tcp_port, get_service_protocol)
+    unzip, new_tmp_dir, short_uid, load_file, to_str, mkdir, download,
+    run_safe, get_free_tcp_port, get_service_protocol)
 from localstack.services.infra import start_proxy
 from localstack.services.awslambda import lambda_api, lambda_executors
 from localstack.services.generic_proxy import ProxyListener
@@ -27,6 +30,7 @@ TEST_LAMBDA_RUBY = os.path.join(THIS_FOLDER, 'lambdas', 'lambda_integration.rb')
 TEST_LAMBDA_DOTNETCORE2 = os.path.join(THIS_FOLDER, 'lambdas', 'dotnetcore2', 'dotnetcore2.zip')
 TEST_LAMBDA_CUSTOM_RUNTIME = os.path.join(THIS_FOLDER, 'lambdas', 'custom-runtime')
 TEST_LAMBDA_JAVA = os.path.join(LOCALSTACK_ROOT_FOLDER, 'localstack', 'infra', 'localstack-utils-tests.jar')
+TEST_LAMBDA_JAVA_WITH_LIB = os.path.join(THIS_FOLDER, 'lambdas', 'java', 'lambda-function-with-lib-0.0.1.jar')
 TEST_LAMBDA_ENV = os.path.join(THIS_FOLDER, 'lambdas', 'lambda_environment.py')
 
 TEST_LAMBDA_NAME_PY = 'test_lambda_py'
@@ -106,6 +110,34 @@ class TestLambdaBaseFeatures(unittest.TestCase):
         finally:
             config.LAMBDA_FALLBACK_URL = ''
 
+    def test_add_lambda_permission(self):
+        iam_client = aws_stack.connect_to_service('iam')
+        lambda_client = aws_stack.connect_to_service('lambda')
+
+        # create lambda permission
+        action = 'lambda:InvokeFunction'
+        sid = 's3'
+        resp = lambda_client.add_permission(FunctionName=TEST_LAMBDA_NAME_PY, Action=action,
+            StatementId=sid, Principal='s3.amazonaws.com', SourceArn=aws_stack.s3_bucket_arn('test-bucket'))
+        self.assertIn('Statement', resp)
+        # fetch lambda policy
+        policy = lambda_client.get_policy(FunctionName=TEST_LAMBDA_NAME_PY)['Policy']
+        self.assertIsInstance(policy, six.string_types)
+        policy = json.loads(to_str(policy))
+        self.assertEqual(policy['Statement'][0]['Action'], action)
+        self.assertEqual(policy['Statement'][0]['Sid'], sid)
+        self.assertEqual(policy['Statement'][0]['Resource'], lambda_api.func_arn(TEST_LAMBDA_NAME_PY))
+        # fetch IAM policy
+        policies = iam_client.list_policies(Scope='Local', MaxItems=500)['Policies']
+        matching = [p for p in policies if p['PolicyName'] == 'lambda_policy_%s' % TEST_LAMBDA_NAME_PY]
+        self.assertEqual(len(matching), 1)
+        self.assertIn(':policy/', matching[0]['Arn'])
+
+        # remove permission that we just added
+        resp = lambda_client.remove_permission(FunctionName=TEST_LAMBDA_NAME_PY,
+            StatementId=resp['Statement'], Qualifier='qual1', RevisionId='r1')
+        self.assertEqual(resp['ResponseMetadata']['HTTPStatusCode'], 200)
+
 
 class TestPythonRuntimes(LambdaTestBase):
     @classmethod
@@ -161,29 +193,6 @@ class TestPythonRuntimes(LambdaTestBase):
 
         self.assertEqual(result['StatusCode'], 204)
 
-    def test_add_lambda_permission(self):
-        iam_client = aws_stack.connect_to_service('iam')
-
-        # create lambda permission
-        action = 'lambda:InvokeFunction'
-        resp = self.lambda_client.add_permission(FunctionName=TEST_LAMBDA_NAME_PY, Action=action,
-            StatementId='s3', Principal='s3.amazonaws.com', SourceArn=aws_stack.s3_bucket_arn('test-bucket'))
-        self.assertIn('Statement', resp)
-        # fetch lambda policy
-        policy = self.lambda_client.get_policy(FunctionName=TEST_LAMBDA_NAME_PY)['Policy']
-        self.assertEqual(policy['Statement'][0]['Action'], action)
-        self.assertEqual(policy['Statement'][0]['Resource'], lambda_api.func_arn(TEST_LAMBDA_NAME_PY))
-        # fetch IAM policy
-        policies = iam_client.list_policies(Scope='Local', MaxItems=500)['Policies']
-        matching = [p for p in policies if p['PolicyName'] == 'lambda_policy_%s' % TEST_LAMBDA_NAME_PY]
-        self.assertEqual(len(matching), 1)
-        self.assertIn(':policy/', matching[0]['Arn'])
-
-        # remove permission that we just added
-        resp = self.lambda_client.remove_permission(FunctionName=TEST_LAMBDA_NAME_PY,
-            StatementId=resp['Statement'], Qualifier='qual1', RevisionId='r1')
-        self.assertEqual(resp['ResponseMetadata']['HTTPStatusCode'], 200)
-
     def test_lambda_environment(self):
         vars = {'Hello': 'World'}
         zip_file = testutil.create_lambda_archive(
@@ -210,7 +219,7 @@ class TestPythonRuntimes(LambdaTestBase):
 
     def test_invocation_with_qualifier(self):
         lambda_name = 'test_lambda_%s' % short_uid()
-        bucket_name = 'test_bucket_lambda2'
+        bucket_name = 'test-bucket-lambda2'
         bucket_key = 'test_lambda.zip'
 
         # upload zip file to S3
@@ -264,7 +273,7 @@ class TestPythonRuntimes(LambdaTestBase):
 
     def test_upload_lambda_from_s3(self):
         lambda_name = 'test_lambda_%s' % short_uid()
-        bucket_name = 'test_bucket_lambda'
+        bucket_name = 'test-bucket-lambda'
         bucket_key = 'test_lambda.zip'
 
         # upload zip file to S3
@@ -327,6 +336,21 @@ class TestPythonRuntimes(LambdaTestBase):
 
         # clean up
         testutil.delete_lambda_function(TEST_LAMBDA_NAME_PY3)
+
+    def test_handler_in_submodule(self):
+        func_name = 'lambda-%s' % short_uid()
+        zip_file = testutil.create_lambda_archive(
+            load_file(TEST_LAMBDA_PYTHON), get_content=True,
+            libs=TEST_LAMBDA_LIBS, runtime=LAMBDA_RUNTIME_PYTHON36,
+            file_name='abc/def/main.py')
+        testutil.create_lambda_function(func_name=func_name, zip_file=zip_file,
+            handler='abc.def.main.handler', runtime=LAMBDA_RUNTIME_PYTHON36)
+
+        # invoke function and assert result
+        result = self.lambda_client.invoke(FunctionName=func_name, Payload=b'{}')
+        result_data = json.loads(result['Payload'].read())
+        self.assertEqual(result['StatusCode'], 200)
+        self.assertEqual(result_data['event'], json.loads('{}'))
 
 
 class TestNodeJSRuntimes(LambdaTestBase):
@@ -514,6 +538,32 @@ class TestJavaRuntimes(LambdaTestBase):
 
         self.assertEqual(result['StatusCode'], 200)
         self.assertIn('LinkedHashMap', to_str(result_data))
+
+    def test_java_runtime_with_lib(self):
+        java_jar_with_lib = load_file(TEST_LAMBDA_JAVA_WITH_LIB, mode='rb')
+
+        # create ZIP file from JAR file
+        jar_dir = new_tmp_dir()
+        zip_dir = new_tmp_dir()
+        unzip(TEST_LAMBDA_JAVA_WITH_LIB, jar_dir)
+        shutil.move(os.path.join(jar_dir, 'lib'), os.path.join(zip_dir, 'lib'))
+        jar_without_libs_file = testutil.create_zip_file(jar_dir)
+        shutil.copy(jar_without_libs_file, os.path.join(zip_dir, 'lib', 'lambda.jar'))
+        java_zip_with_lib = testutil.create_zip_file(zip_dir, get_content=True)
+
+        for archive in [java_jar_with_lib, java_zip_with_lib]:
+            lambda_name = 'test-%s' % short_uid()
+            testutil.create_lambda_function(func_name=lambda_name,
+                zip_file=archive, runtime=LAMBDA_RUNTIME_JAVA8,
+                handler='cloud.localstack.sample.LambdaHandlerWithLib')
+
+            result = self.lambda_client.invoke(FunctionName=lambda_name, Payload=b'{"echo":"echo"}')
+            result_data = result['Payload'].read()
+
+            self.assertEqual(result['StatusCode'], 200)
+            self.assertIn('echo', to_str(result_data))
+            # clean up
+            testutil.delete_lambda_function(lambda_name)
 
     def test_sns_event(self):
         result = self.lambda_client.invoke(

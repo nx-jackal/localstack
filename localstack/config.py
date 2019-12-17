@@ -9,9 +9,8 @@ from os.path import expanduser
 import six
 from boto3 import Session
 from localstack.constants import (
-    DEFAULT_SERVICE_PORTS, LOCALHOST, PATH_USER_REQUEST, DEFAULT_PORT_WEB_UI, TRUE_STRINGS, FALSE_STRINGS)
-
-TRUE_VALUES = ('1', 'true')
+    DEFAULT_SERVICE_PORTS, LOCALHOST, DEFAULT_PORT_WEB_UI, TRUE_STRINGS, FALSE_STRINGS,
+    DEFAULT_LAMBDA_CONTAINER_REGISTRY)
 
 # java options to Lambda
 LAMBDA_JAVA_OPTS = os.environ.get('LAMBDA_JAVA_OPTS', '').strip()
@@ -46,10 +45,16 @@ SQS_PORT_EXTERNAL = int(os.environ.get('SQS_PORT_EXTERNAL') or 0)
 LOCALSTACK_HOSTNAME = os.environ.get('LOCALSTACK_HOSTNAME', '').strip() or HOSTNAME
 
 # whether to remotely copy the lambda or locally mount a volume
-LAMBDA_REMOTE_DOCKER = os.environ.get('LAMBDA_REMOTE_DOCKER', '').lower().strip() in TRUE_VALUES
+LAMBDA_REMOTE_DOCKER = os.environ.get('LAMBDA_REMOTE_DOCKER', '').lower().strip() in TRUE_STRINGS
 
 # network that the docker lambda container will be joining
 LAMBDA_DOCKER_NETWORK = os.environ.get('LAMBDA_DOCKER_NETWORK', '').strip()
+
+# default container registry for lambda execution images
+LAMBDA_CONTAINER_REGISTRY = os.environ.get('LAMBDA_CONTAINER_REGISTRY', '').strip() or DEFAULT_LAMBDA_CONTAINER_REGISTRY
+
+# whether to remove containers after Lambdas finished executing
+LAMBDA_REMOVE_CONTAINERS = os.environ.get('LAMBDA_REMOVE_CONTAINERS', '').lower().strip() not in FALSE_STRINGS
 
 # directory for persisting data
 DATA_DIR = os.environ.get('DATA_DIR', '').strip()
@@ -139,16 +144,14 @@ LAMBDA_FALLBACK_URL = os.environ.get('LAMBDA_FALLBACK_URL', '').strip()
 # Make sure to keep this in sync with the above!
 # Note: do *not* include DATA_DIR in this list, as it is treated separately
 CONFIG_ENV_VARS = ['SERVICES', 'HOSTNAME', 'HOSTNAME_EXTERNAL', 'LOCALSTACK_HOSTNAME', 'LAMBDA_FALLBACK_URL',
-                   'LAMBDA_EXECUTOR', 'LAMBDA_REMOTE_DOCKER', 'LAMBDA_DOCKER_NETWORK', 'USE_SSL', 'DEBUG',
-                   'KINESIS_ERROR_PROBABILITY', 'DYNAMODB_ERROR_PROBABILITY', 'PORT_WEB_UI', 'START_WEB',
-                   'DOCKER_BRIDGE_IP', 'DEFAULT_REGION', 'LAMBDA_JAVA_OPTS', 'LOCALSTACK_API_KEY']
+                   'LAMBDA_EXECUTOR', 'LAMBDA_REMOTE_DOCKER', 'LAMBDA_DOCKER_NETWORK', 'LAMBDA_REMOVE_CONTAINERS',
+                   'USE_SSL', 'DEBUG', 'KINESIS_ERROR_PROBABILITY', 'DYNAMODB_ERROR_PROBABILITY', 'PORT_WEB_UI',
+                   'START_WEB', 'DOCKER_BRIDGE_IP', 'DEFAULT_REGION', 'LAMBDA_JAVA_OPTS', 'LOCALSTACK_API_KEY',
+                   'LAMBDA_CONTAINER_REGISTRY', 'TEST_AWS_ACCOUNT_ID']
 
 for key, value in six.iteritems(DEFAULT_SERVICE_PORTS):
     clean_key = key.upper().replace('-', '_')
     CONFIG_ENV_VARS += [clean_key + '_BACKEND', clean_key + '_PORT', clean_key + '_PORT_EXTERNAL']
-
-# create variable aliases prefixed with LOCALSTACK_ (except LOCALSTACK_HOSTNAME)
-CONFIG_ENV_VARS += ['LOCALSTACK_' + v for v in CONFIG_ENV_VARS]
 
 
 def ping(host):
@@ -168,6 +171,7 @@ def in_docker():
 
 
 is_in_docker = in_docker()
+is_in_linux = is_linux()
 
 # determine IP of Docker bridge
 if not DOCKER_BRIDGE_IP:
@@ -182,10 +186,14 @@ if not DOCKER_BRIDGE_IP:
 # determine route to Docker host from container
 try:
     DOCKER_HOST_FROM_CONTAINER = DOCKER_BRIDGE_IP
-    if not is_in_docker:
-        DOCKER_HOST_FROM_CONTAINER = socket.gethostbyname('host.docker.internal')
+    if not is_in_docker and not is_in_linux:
+        # If we're running outside docker, and would like the Lambda containers to be able
+        # to access services running on the local machine, set DOCKER_HOST_FROM_CONTAINER accordingly
+        if LOCALSTACK_HOSTNAME == HOSTNAME:
+            DOCKER_HOST_FROM_CONTAINER = 'host.docker.internal'
     # update LOCALSTACK_HOSTNAME if host.docker.internal is available
     if is_in_docker and LOCALSTACK_HOSTNAME == DOCKER_BRIDGE_IP:
+        DOCKER_HOST_FROM_CONTAINER = socket.gethostbyname('host.docker.internal')
         LOCALSTACK_HOSTNAME = DOCKER_HOST_FROM_CONTAINER
 except socket.error:
     pass
@@ -243,7 +251,7 @@ def parse_service_ports():
 
 
 def populate_configs(service_ports=None):
-    global SERVICE_PORTS
+    global SERVICE_PORTS, CONFIG_ENV_VARS
 
     SERVICE_PORTS = service_ports or parse_service_ports()
     globs = globals()
@@ -254,7 +262,7 @@ def populate_configs(service_ports=None):
 
         # define PORT_* variables with actual service ports as per configuration
         port_var_name = 'PORT_%s' % key_upper
-        port_number = SERVICE_PORTS.get(key, 0)
+        port_number = service_port(key)
         globs[port_var_name] = port_number
         url = 'http%s://%s:%s' % ('s' if USE_SSL else '', LOCALSTACK_HOSTNAME, port_number)
         # define TEST_*_URL variables with mock service endpoints
@@ -266,16 +274,25 @@ def populate_configs(service_ports=None):
     # expose LOCALSTACK_HOSTNAME as env. variable
     os.environ['LOCALSTACK_HOSTNAME'] = LOCALSTACK_HOSTNAME
 
+    # create variable aliases prefixed with LOCALSTACK_ (except LOCALSTACK_HOSTNAME)
+    CONFIG_ENV_VARS += ['LOCALSTACK_' + v for v in CONFIG_ENV_VARS if not v.startswith('LOCALSTACK_')]
+    CONFIG_ENV_VARS = list(set(CONFIG_ENV_VARS))
+
 
 def service_port(service_key):
     return SERVICE_PORTS.get(service_key, 0)
+
+
+def external_service_url(service_key, host=None):
+    host = host or HOSTNAME_EXTERNAL
+    return 'http%s://%s:%s' % ('s' if USE_SSL else '', host, service_port(service_key))
 
 
 # initialize config values
 populate_configs()
 
 # set log level
-if os.environ.get('DEBUG', '').lower() in TRUE_VALUES:
+if os.environ.get('DEBUG', '').lower() in TRUE_STRINGS:
     logging.getLogger('').setLevel(logging.DEBUG)
     logging.getLogger('localstack').setLevel(logging.DEBUG)
 
@@ -283,8 +300,4 @@ if os.environ.get('DEBUG', '').lower() in TRUE_VALUES:
 BUNDLE_API_PROCESSES = True
 
 # whether to use a CPU/memory profiler when running the integration tests
-USE_PROFILER = os.environ.get('USE_PROFILER', '').lower() in TRUE_VALUES
-
-# set URL pattern of inbound API gateway
-INBOUND_GATEWAY_URL_PATTERN = ('%s/restapis/{api_id}/{stage_name}/%s{path}' %
-                               (TEST_APIGATEWAY_URL, PATH_USER_REQUEST))  # noqa
+USE_PROFILER = os.environ.get('USE_PROFILER', '').lower() in TRUE_STRINGS

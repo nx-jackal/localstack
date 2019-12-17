@@ -7,7 +7,7 @@ import requests
 import xmltodict
 from requests.models import Response, Request
 from six.moves.urllib import parse as urlparse
-from localstack.config import TEST_SNS_URL
+from localstack.config import external_service_url
 from localstack.constants import TEST_AWS_ACCOUNT_ID, MOTO_ACCOUNT_ID
 from localstack.utils.aws import aws_stack
 from localstack.utils.common import short_uid, to_str, timestamp, TIMESTAMP_FORMAT_MILLIS
@@ -35,6 +35,7 @@ class ProxyListenerSNS(ProxyListener):
         # check region
         try:
             aws_stack.check_valid_region(headers)
+            aws_stack.set_default_region_in_headers(headers)
         except Exception as e:
             return make_error(message=str(e), code=400)
 
@@ -139,6 +140,7 @@ class ProxyListenerSNS(ProxyListener):
             if req_action == 'Subscribe' and response.status_code < 400:
                 response_data = xmltodict.parse(response.content)
                 topic_arn = (req_data.get('TargetArn') or req_data.get('TopicArn'))[0]
+                filter_policy = (req_data.get('FilterPolicy') or [None])[0]
                 attributes = get_subscribe_attributes(req_data)
                 sub_arn = response_data['SubscribeResponse']['SubscribeResult']['SubscriptionArn']
                 do_subscribe(
@@ -146,7 +148,8 @@ class ProxyListenerSNS(ProxyListener):
                     req_data['Endpoint'][0],
                     req_data['Protocol'][0],
                     sub_arn,
-                    attributes
+                    attributes,
+                    filter_policy
                 )
             if req_action == 'CreateTopic' and response.status_code < 400:
                 response_data = xmltodict.parse(response.content)
@@ -172,7 +175,7 @@ def publish_message(topic_arn, req_data, subscription_arn=None):
     for subscriber in SNS_SUBSCRIPTIONS.get(topic_arn, []):
         if subscription_arn not in [None, subscriber['SubscriptionArn']]:
             continue
-        filter_policy = json.loads(subscriber.get('FilterPolicy', '{}'))
+        filter_policy = json.loads(subscriber.get('FilterPolicy') or '{}')
         message_attributes = get_message_attributes(req_data)
         if not check_filter_policy(filter_policy, message_attributes):
             continue
@@ -230,7 +233,7 @@ def do_delete_topic(topic_arn):
     SNS_SUBSCRIPTIONS.pop(topic_arn, None)
 
 
-def do_subscribe(topic_arn, endpoint, protocol, subscription_arn, attributes):
+def do_subscribe(topic_arn, endpoint, protocol, subscription_arn, attributes, filter_policy=None):
     # An endpoint may only be subscribed to a topic once. Subsequent
     # subscribe calls do nothing (subscribe is idempotent).
     for existing_topic_subscription in SNS_SUBSCRIPTIONS.get(topic_arn, []):
@@ -243,6 +246,7 @@ def do_subscribe(topic_arn, endpoint, protocol, subscription_arn, attributes):
         'Endpoint': endpoint,
         'Protocol': protocol,
         'SubscriptionArn': subscription_arn,
+        'FilterPolicy': filter_policy
     }
     subscription.update(attributes)
     SNS_SUBSCRIPTIONS[topic_arn].append(subscription)
@@ -250,12 +254,13 @@ def do_subscribe(topic_arn, endpoint, protocol, subscription_arn, attributes):
     # Send out confirmation message for HTTP(S), fix for https://github.com/localstack/localstack/issues/881
     if protocol in ['http', 'https']:
         token = short_uid()
+        external_url = external_service_url('sns')
         confirmation = {
             'Type': ['SubscriptionConfirmation'],
             'Token': [token],
             'Message': [('You have chosen to subscribe to the topic %s.\n' % topic_arn) +
                 'To confirm the subscription, visit the SubscribeURL included in this message.'],
-            'SubscribeURL': ['%s/?Action=ConfirmSubscription&TopicArn=%s&Token=%s' % (TEST_SNS_URL, topic_arn, token)]
+            'SubscribeURL': ['%s/?Action=ConfirmSubscription&TopicArn=%s&Token=%s' % (external_url, topic_arn, token)]
         }
         publish_message(topic_arn, confirmation, subscription_arn)
 
@@ -378,7 +383,7 @@ def create_sqs_message_attributes(subscriber, attributes):
         if value['Type'] == 'Binary':
             attribute['BinaryValue'] = value['Value']
         else:
-            attribute['StringValue'] = value['Value']
+            attribute['StringValue'] = str(value['Value'])
         message_attributes[key] = attribute
 
     return message_attributes
@@ -398,6 +403,9 @@ def get_message_attributes(req_data):
                 attribute['Value'] = string_value
             elif binary_value is not None:
                 attribute['Value'] = binary_value
+
+            if attribute['Type'] == 'Number':
+                attribute['Value'] = float(attribute['Value'])
 
             attributes[name] = attribute
             x += 1

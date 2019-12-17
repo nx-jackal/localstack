@@ -1,5 +1,6 @@
 package cloud.localstack.docker;
 
+import cloud.localstack.Localstack;
 import cloud.localstack.docker.command.*;
 
 import java.io.IOException;
@@ -30,6 +31,7 @@ public class Container {
     private static final int NUM_LOG_LINES = 10;
 
     private static final String ENV_DEBUG = "DEBUG";
+    private static final String ENV_USE_SSL = "USE_SSL";
     private static final String ENV_DEBUG_DEFAULT = "1";
     public static final String LOCALSTACK_EXTERNAL_HOSTNAME = "HOSTNAME_EXTERNAL";
 
@@ -46,25 +48,32 @@ public class Container {
      *                       in order to prevent conflicts with other localstack containers running on the same machine
      * @param environmentVariables map of environment variables to be passed to the docker container
      */
-    public static Container createLocalstackContainer(String externalHostName, boolean pullNewImage,
-                                                      boolean randomizePorts, String imageTag,
-                                                      Map<String, String> environmentVariables) {
+    public static Container createLocalstackContainer(
+        String externalHostName, boolean pullNewImage, boolean randomizePorts, String imageTag,
+        Map<String, String> environmentVariables, Map<Integer, Integer> portMappings) {
+
+        environmentVariables = environmentVariables == null ? Collections.emptyMap() : environmentVariables;
+        portMappings = portMappings == null ? Collections.emptyMap() : portMappings;
 
         if(pullNewImage) {
             LOG.info("Pulling latest image...");
             new PullCommand(LOCALSTACK_NAME, imageTag).execute();
         }
 
-        String containerId = new RunCommand(LOCALSTACK_NAME, imageTag)
-                .withExposedPorts(LOCALSTACK_PORTS, randomizePorts)
-                .withEnvironmentVariable(LOCALSTACK_EXTERNAL_HOSTNAME, externalHostName)
-                .withEnvironmentVariable(ENV_DEBUG, ENV_DEBUG_DEFAULT)
-                .withEnvironmentVariables(environmentVariables)
-                .execute();
+        RunCommand runCommand = new RunCommand(LOCALSTACK_NAME, imageTag)
+            .withExposedPorts(LOCALSTACK_PORTS, randomizePorts)
+            .withEnvironmentVariable(LOCALSTACK_EXTERNAL_HOSTNAME, externalHostName)
+            .withEnvironmentVariable(ENV_DEBUG, ENV_DEBUG_DEFAULT)
+            .withEnvironmentVariable(ENV_USE_SSL, Localstack.INSTANCE.useSSL() ? "1" : "0")
+            .withEnvironmentVariables(environmentVariables);
+        for (Integer port : portMappings.keySet()) {
+            runCommand = runCommand.withExposedPorts("" + port, false);
+        }
+        String containerId = runCommand.execute();
         LOG.info("Started container: " + containerId);
 
-        List<PortMapping> portMappings = new PortCommand(containerId).execute();
-        return new Container(containerId, portMappings);
+        List<PortMapping> portMappingsList = new PortCommand(containerId).execute();
+        return new Container(containerId, portMappingsList);
     }
 
 

@@ -1,6 +1,8 @@
+import os
 import re
 import json
 import unittest
+from localstack.utils.common import save_file, new_tmp_dir, mkdir
 from localstack.services.awslambda import lambda_api, lambda_executors
 from localstack.utils.aws.aws_models import LambdaFunction
 
@@ -48,6 +50,37 @@ class TestLambdaAPI(unittest.TestCase):
             lambda_api.event_source_mappings.append({'UUID': self.TEST_UUID})
             result = lambda_api.get_event_source_mapping(self.TEST_UUID)
             self.assertEqual(json.loads(result.get_data()).get('UUID'), self.TEST_UUID)
+
+    def test_get_event_sources(self):
+        with self.app.test_request_context():
+            lambda_api.event_source_mappings.append(
+                {
+                    'UUID': self.TEST_UUID,
+                    'EventSourceArn': 'the_arn'
+                })
+
+            # Match source ARN
+            result = lambda_api.get_event_sources(source_arn='the_arn')
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0].get('UUID'), self.TEST_UUID)
+
+            # No partial match on source ARN
+            result = lambda_api.get_event_sources(source_arn='the_')
+            self.assertEqual(len(result), 0)
+
+    def test_get_event_sources_with_paths(self):
+        with self.app.test_request_context():
+            lambda_api.event_source_mappings.append(
+                {
+                    'UUID': self.TEST_UUID,
+                    'EventSourceArn': 'the_arn/path/subpath'
+                })
+
+            # Do partial match on paths
+            result = lambda_api.get_event_sources(source_arn='the_arn')
+            self.assertEqual(len(result), 1)
+            result = lambda_api.get_event_sources(source_arn='the_arn/path')
+            self.assertEqual(len(result), 1)
 
     def test_delete_event_source_mapping(self):
         with self.app.test_request_context():
@@ -125,6 +158,7 @@ class TestLambdaAPI(unittest.TestCase):
             expected_result['LastModified'] = self.LAST_MODIFIED
             expected_result['TracingConfig'] = self.TRACING_CONFIG
             expected_result['Version'] = '1'
+            expected_result['State'] = 'Active'
             expected_result2 = dict(expected_result)
             expected_result2['FunctionArn'] = str(lambda_api.func_arn(self.FUNCTION_NAME)) + ':2'
             expected_result2['Version'] = '2'
@@ -163,6 +197,7 @@ class TestLambdaAPI(unittest.TestCase):
             latest_version['LastModified'] = self.LAST_MODIFIED
             latest_version['TracingConfig'] = self.TRACING_CONFIG
             latest_version['Version'] = '$LATEST'
+            latest_version['State'] = 'Active'
             version1 = dict(latest_version)
             version1['FunctionArn'] = str(lambda_api.func_arn(self.FUNCTION_NAME)) + ':1'
             version1['Version'] = '1'
@@ -410,19 +445,36 @@ class TestLambdaAPI(unittest.TestCase):
 
     def test_java_options_with_only_memory_options(self):
         expected = '-Xmx512M'
-        result = self.prepareJavaOpts(expected)
+        result = self.prepare_java_opts(expected)
         self.assertEqual(expected, result)
 
     def test_java_options_with_memory_options_and_agentlib_option(self):
         expected = '.*transport=dt_socket,server=y,suspend=y,address=[0-9]+'
-        result = self.prepareJavaOpts('-Xmx512M -agentlib:jdwp=transport=dt_socket,server=y'
+        result = self.prepare_java_opts('-Xmx512M -agentlib:jdwp=transport=dt_socket,server=y'
                                       ',suspend=y,address=_debug_port_')
         self.assertTrue(re.match(expected, result))
 
-    def prepareJavaOpts(self, java_opts):
+    def prepare_java_opts(self, java_opts):
         lambda_executors.config.LAMBDA_JAVA_OPTS = java_opts
         result = lambda_executors.Util.get_java_opts()
         return result
+
+    def test_get_java_lib_folder_classpath(self):
+        jar_file = os.path.join(new_tmp_dir(), 'foo.jar')
+        save_file(jar_file, '')
+        self.assertEquals('.:foo.jar', lambda_executors.Util.get_java_classpath(jar_file))
+
+    def test_get_java_lib_folder_classpath_no_directories(self):
+        base_dir = new_tmp_dir()
+        jar_file = os.path.join(base_dir, 'foo.jar')
+        save_file(jar_file, '')
+        lib_file = os.path.join(base_dir, 'lib', 'lib.jar')
+        mkdir(os.path.dirname(lib_file))
+        save_file(lib_file, '')
+        self.assertEquals('.:lib/lib.jar:foo.jar', lambda_executors.Util.get_java_classpath(jar_file))
+
+    def test_get_java_lib_folder_classpath_archive_is_None(self):
+        self.assertRaises(TypeError, lambda_executors.Util.get_java_classpath, None)
 
     def _create_function(self, function_name, tags={}):
         arn = lambda_api.func_arn(function_name)

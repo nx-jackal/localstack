@@ -13,7 +13,7 @@ from localstack import constants, config
 from localstack.constants import (
     ENV_DEV, LOCALSTACK_VENV_FOLDER, ENV_INTERNAL_TEST_RUN, LOCALSTACK_INFRA_PROCESS,
     DEFAULT_PORT_APIGATEWAY_BACKEND, DEFAULT_PORT_SNS_BACKEND,
-    DEFAULT_PORT_EC2_BACKEND, DEFAULT_SERVICE_PORTS)
+    DEFAULT_PORT_EC2_BACKEND, DEFAULT_PORT_EVENTS_BACKEND, DEFAULT_SERVICE_PORTS)
 from localstack.utils import common, persistence
 from localstack.utils.common import (TMP_THREADS, run, get_free_tcp_port, is_linux,
     FuncThread, ShellCommandThread, get_service_protocol, in_docker, is_port_open)
@@ -48,11 +48,12 @@ SERVICE_PLUGINS = {}
 
 class Plugin(object):
 
-    def __init__(self, name, start, check=None, listener=None):
+    def __init__(self, name, start, check=None, listener=None, priority=0):
         self.plugin_name = name
         self.start_function = start
         self.listener = listener
         self.check_function = check
+        self.priority = priority
 
     def start(self, asynchronous):
         kwargs = {
@@ -72,6 +73,10 @@ class Plugin(object):
 
 
 def register_plugin(plugin):
+    existing = SERVICE_PLUGINS.get(plugin.name())
+    if existing:
+        if existing.priority > plugin.priority:
+            return
     SERVICE_PLUGINS[plugin.name()] = plugin
 
 
@@ -138,9 +143,10 @@ def start_cloudwatch_logs(port=None, asynchronous=False):
     return start_moto_server('logs', port, name='CloudWatch Logs', asynchronous=asynchronous)
 
 
-def start_events(port=None, asynchronous=False):
+def start_events(port=None, asynchronous=False, update_listener=None):
     port = port or config.PORT_EVENTS
-    return start_moto_server('events', port, name='CloudWatch Events', asynchronous=asynchronous)
+    return start_moto_server('events', port, name='CloudWatch Events', asynchronous=asynchronous,
+        backend_port=DEFAULT_PORT_EVENTS_BACKEND, update_listener=update_listener)
 
 
 def start_sts(port=None, asynchronous=False):
@@ -277,7 +283,7 @@ def do_run(cmd, asynchronous, print_output=False, env_vars={}):
         t.start()
         TMP_THREADS.append(t)
         return t
-    return run(cmd)
+    return run(cmd, env_vars=env_vars)
 
 
 def start_proxy_for_service(service_name, port, default_backend_port, update_listener, quiet=False, params={}):
@@ -428,9 +434,6 @@ def start_infra(asynchronous=False, apis=None):
         sleep_time = 5
         # start services
         thread = None
-
-        if 'elasticsearch' in apis or 'es' in apis:
-            sleep_time = max(sleep_time, 10)
 
         # loop through plugins and start each service
         for name, plugin in SERVICE_PLUGINS.items():

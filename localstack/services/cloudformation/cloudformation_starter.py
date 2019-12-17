@@ -68,8 +68,9 @@ def set_moto_account_ids(resource_json):
     def fix_ids(obj, **kwargs):
         if isinstance(obj, dict):
             for key, value in obj.items():
-                if 'arn' in key.lower() and isinstance(value, six.string_types):
-                    obj[key] = value.replace(TEST_AWS_ACCOUNT_ID, MOTO_ACCOUNT_ID)
+                if isinstance(value, six.string_types):
+                    if 'arn' in key.lower() or (':%s:' % TEST_AWS_ACCOUNT_ID) in value:
+                        obj[key] = value.replace(TEST_AWS_ACCOUNT_ID, MOTO_ACCOUNT_ID)
         return obj
 
     return recurse_object(resource_json, fix_ids)
@@ -214,31 +215,45 @@ def apply_patches():
         # check whether this resource needs to be deployed
         resource_wrapped = {logical_id: resource_json}
         should_be_created = template_deployer.should_be_deployed(logical_id, resource_wrapped, stack_name)
-        if not should_be_created:
-            # This resource is either not deployable or already exists. Check if it can be updated
-            if not template_deployer.is_updateable(logical_id, resource_wrapped, stack_name):
-                LOG.debug('Resource %s need not be deployed: %s %s' % (logical_id, resource_json, bool(resource)))
-                # Return if this resource already exists and cannot be updated
-                return resource
 
         # fix resource ARNs, make sure to convert account IDs 000000000000 to 123456789012
         resource_json_arns_fixed = clone(json_safe(convert_objs_to_ids(resource_json)))
         set_moto_account_ids(resource_json_arns_fixed)
+
         # create resource definition and store CloudFormation metadata in moto
         if resource or update:
             parse_and_update_resource_orig(logical_id,
                 resource_json_arns_fixed, resources_map, region_name)
         elif not resource:
-            resource = parse_and_create_resource_orig(logical_id,
-                resource_json_arns_fixed, resources_map, region_name)
+            try:
+                resource = parse_and_create_resource_orig(logical_id,
+                    resource_json_arns_fixed, resources_map, region_name)
+            except Exception as e:
+                if should_be_created:
+                    raise
+                else:
+                    LOG.info('Error on moto CF resource creation. Ignoring, as should_be_created=%s: %s' %
+                             (should_be_created, e))
+
         # Fix for moto which sometimes hard-codes region name as 'us-east-1'
         if hasattr(resource, 'region_name') and resource.region_name != region_name:
             LOG.debug('Updating incorrect region from %s to %s' % (resource.region_name, region_name))
             resource.region_name = region_name
 
+        # check whether this resource needs to be deployed
+        is_updateable = False
+        if not should_be_created:
+            # This resource is either not deployable or already exists. Check if it can be updated
+            is_updateable = template_deployer.is_updateable(logical_id, resource_wrapped, stack_name)
+            if not update or not is_updateable:
+                LOG.debug('Resource %s need not be deployed: %s %s' % (logical_id, resource_json, bool(resource)))
+                # Return if this resource already exists and can/need not be updated
+                return resource
+
         # Apply some fixes/patches to the resource names, then deploy resource in LocalStack
         update_resource_name(resource, resource_json)
-        LOG.debug('Deploying CloudFormation resource (update=%s): %s' % (update, resource_json))
+        LOG.debug('Deploying CloudFormation resource (update=%s, exists=%s, updateable=%s): %s' %
+                  (update, not should_be_created, is_updateable, resource_json))
 
         try:
             CURRENTLY_UPDATING_RESOURCES[resource_hash_key] = True
@@ -593,6 +608,19 @@ def apply_patches():
         return template.render(stack=stack, resource=resource)
 
     responses.CloudFormationResponse.describe_stack_resource = describe_stack_resource
+
+    # fix moto's describe_stack_events jinja2.exceptions.UndefinedError
+
+    def cf_describe_stack_events(self):
+        stack_name = self._get_param('StackName')
+        stack = self.cloudformation_backend.get_stack(stack_name)
+        if not stack:
+            raise ValidationError(stack_name,
+                message='Unable to find stack "%s" in region %s' % (stack_name, aws_stack.get_region()))
+        return cf_describe_stack_events_orig(self)
+
+    cf_describe_stack_events_orig = responses.CloudFormationResponse.describe_stack_events
+    responses.CloudFormationResponse.describe_stack_events = cf_describe_stack_events
 
 
 def inject_stats_endpoint():

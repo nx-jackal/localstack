@@ -14,6 +14,7 @@ API_PREFIX = '/2015-01-01'
 ES_DOMAINS = {}
 
 app = Flask(APP_NAME)
+app.url_map.strict_slashes = False
 
 
 def error_response(error_type, code=400, message='Unknown error.'):
@@ -72,6 +73,9 @@ def get_domain_config(domain_name):
                     'ZoneAwarenessEnabled': False
                 },
                 'Status': config_status
+            },
+            'CognitoOptions': {
+                'Enabled': False
             },
             'ElasticsearchVersion': {
                 'Options': '5.3',
@@ -147,8 +151,35 @@ def get_domain_status(domain_name, deleted=False):
                 'VolumeSize': 10,
                 'Iops': 0
             },
+            'CognitoOptions': {
+                'Enabled': False
+            },
         }
     }
+
+
+def start_elasticsearch_instance():
+    # Note: keep imports here to avoid circular dependencies
+    from localstack.services.es import es_starter
+    from localstack.services.infra import check_infra, restore_persisted_data, Plugin
+
+    api_name = 'elasticsearch'
+    plugin = Plugin(api_name, start=es_starter.start_elasticsearch, check=es_starter.check_elasticsearch)
+    t1 = plugin.start(asynchronous=True)
+    # sleep some time to give Elasticsearch enough time to come up
+    time.sleep(8)
+    apis = [api_name]
+    # ensure that all infra components are up and running
+    check_infra(apis=apis, additional_checks=[es_starter.check_elasticsearch])
+    # restore persisted data
+    restore_persisted_data(apis=apis)
+    return t1
+
+
+def cleanup_elasticsearch_instance():
+    # Note: keep imports here to avoid circular dependencies
+    from localstack.services.es import es_starter
+    es_starter.stop_elasticsearch()
 
 
 @app.route('%s/domain' % API_PREFIX, methods=['GET'])
@@ -166,6 +197,8 @@ def create_domain():
     if domain_name in ES_DOMAINS:
         return error_response(error_type='ResourceAlreadyExistsException')
     ES_DOMAINS[domain_name] = data
+    # start actual Elasticsearch instance
+    start_elasticsearch_instance()
     result = get_domain_status(domain_name)
     # record event
     event_publisher.fire_event(event_publisher.EVENT_ES_CREATE_DOMAIN,
@@ -193,6 +226,8 @@ def delete_domain(domain_name):
         return error_response(error_type='ResourceNotFoundException')
     result = get_domain_status(domain_name, deleted=True)
     ES_DOMAINS.pop(domain_name)
+    if not ES_DOMAINS:
+        cleanup_elasticsearch_instance()
     # record event
     event_publisher.fire_event(event_publisher.EVENT_ES_DELETE_DOMAIN,
         payload={'n': event_publisher.get_hash(domain_name)})
